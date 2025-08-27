@@ -58,6 +58,11 @@ class DetectResponse(BaseModel):
     example_response: str
     credits_remaining: int
 
+class CheckoutRequest(BaseModel):
+    plan: str
+    success_url: Optional[str] = None
+    cancel_url: Optional[str] = None
+
 # Perfis Ultra-Específicos para Lançamentos SP
 PROFILES_LANCAMENTO = {
     "INVESTIDOR_EARLY_BIRD": {
@@ -329,7 +334,7 @@ async def get_stats(key: str = None, x_api_key: str = Header(None)):
             "email": data.get("email", "")
         }
     else:
-        data = LOCAL_STORAGE.get(x_api_key)
+        data = LOCAL_STORAGE.get(api_key)
         if not data:
             raise HTTPException(status_code=404, detail="API key not found")
         
@@ -470,14 +475,14 @@ async def get_pricing():
     }
 
 @app.post("/checkout/create-session")
-async def create_checkout_session(plan: str, success_url: str = None, cancel_url: str = None):
+async def create_checkout_session(request: CheckoutRequest):
     """
     Cria sessão de checkout do Stripe
     Body: {"plan": "starter", "success_url": "https://...", "cancel_url": "https://..."}
     """
     
-    if plan not in STRIPE_PRICES:
-        raise HTTPException(status_code=400, detail=f"Invalid plan: {plan}")
+    if request.plan not in STRIPE_PRICES:
+        raise HTTPException(status_code=400, detail=f"Invalid plan: {request.plan}")
     
     try:
         # Import stripe here para não dar erro se não estiver instalado
@@ -487,14 +492,14 @@ async def create_checkout_session(plan: str, success_url: str = None, cancel_url
         checkout_session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{
-                'price': STRIPE_PRICES[plan],
+                'price': STRIPE_PRICES[request.plan],
                 'quantity': 1,
             }],
             mode='payment',
-            success_url=success_url or 'https://psi-api.com/success?session_id={CHECKOUT_SESSION_ID}',
-            cancel_url=cancel_url or 'https://psi-api.com/cancel',
+            success_url=request.success_url or 'https://psi-api.com/success?session_id={CHECKOUT_SESSION_ID}',
+            cancel_url=request.cancel_url or 'https://psi-api.com/cancel',
             metadata={
-                'plan': plan
+                'plan': request.plan
             }
         )
         
@@ -506,7 +511,7 @@ async def create_checkout_session(plan: str, success_url: str = None, cancel_url
     except ImportError:
         # Se Stripe não estiver instalado, simular checkout
         return {
-            "checkout_url": f"https://checkout.stripe.com/pay/test#{plan}",
+            "checkout_url": f"https://checkout.stripe.com/pay/test#{request.plan}",
             "session_id": "cs_test_123",
             "message": "⚠️ Stripe não instalado - checkout simulado"
         }
