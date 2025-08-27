@@ -287,9 +287,10 @@ async def detect(request: DetectRequest, x_api_key: str = Header(None)):
     return response
 
 @app.post("/api/generate-key")
-async def generate_api_key(email: str, credits: int = 100):
+async def generate_api_key(email: str, credits: int = 100, package: str = "manual"):
     """
     Gera nova API key (endpoint admin, proteger em produção)
+    Query params: ?email=teste@test.com&credits=100&package=starter
     """
     # Gerar chave única
     raw = f"{email}{datetime.now()}{credits}"
@@ -301,19 +302,23 @@ async def generate_api_key(email: str, credits: int = 100):
     return {
         "api_key": api_key,
         "credits": credits,
-        "email": email
+        "email": email,
+        "package": package,
+        "created": datetime.now().isoformat()
     }
 
 @app.get("/stats")
-async def get_stats(x_api_key: str = Header(None)):
+async def get_stats(key: str = None, x_api_key: str = Header(None)):
     """
     Retorna estatísticas de uso da API key
+    Aceita key via query param ou header: /stats?key=API_KEY ou Header X-API-Key
     """
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="API Key required")
+    api_key = key or x_api_key
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API Key required via ?key= or X-API-Key header")
     
     if redis_client:
-        data = redis_client.hgetall(f"key:{x_api_key}")
+        data = redis_client.hgetall(f"key:{api_key}")
         if not data:
             raise HTTPException(status_code=404, detail="API key not found")
         
@@ -415,6 +420,218 @@ async def test_detection():
             <li>"I need information about Golden Visa properties"</li>
             <li>"É meu primeiro apartamento, como funciona?"</li>
         </ul>
+    </body>
+    </html>
+    """
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=html)
+
+# =================== STRIPE PAYMENT SYSTEM ===================
+
+# Stripe configuration (usar env vars em produção)
+STRIPE_PUBLISHABLE_KEY = "pk_test_51234567890"  # Colocar sua chave aqui
+STRIPE_SECRET_KEY = "sk_test_51234567890"  # Colocar sua chave secreta aqui
+STRIPE_WEBHOOK_SECRET = "whsec_1234567890"  # Webhook secret
+
+# Price IDs do Stripe (criar no dashboard)
+STRIPE_PRICES = {
+    "starter": "price_starter_197",  # R$ 197 - 2000 créditos
+    "pro": "price_pro_497"           # R$ 497 - 6000 créditos
+}
+
+@app.get("/pricing")
+async def get_pricing():
+    """Retorna informações de pricing para a landing page"""
+    return {
+        "packages": {
+            "trial": {
+                "name": "Trial",
+                "price": 0,
+                "credits": 100,
+                "description": "100 detecções grátis por 7 dias"
+            },
+            "starter": {
+                "name": "Starter", 
+                "price": 197,
+                "original_price": 297,
+                "credits": 2000,
+                "description": "2.000 detecções (~2 meses uso)",
+                "stripe_price_id": STRIPE_PRICES.get("starter")
+            },
+            "pro": {
+                "name": "Pro",
+                "price": 497, 
+                "original_price": 697,
+                "credits": 6000,
+                "description": "6.000 detecções (~6 meses uso)",
+                "stripe_price_id": STRIPE_PRICES.get("pro")
+            }
+        }
+    }
+
+@app.post("/checkout/create-session")
+async def create_checkout_session(plan: str, success_url: str = None, cancel_url: str = None):
+    """
+    Cria sessão de checkout do Stripe
+    Body: {"plan": "starter", "success_url": "https://...", "cancel_url": "https://..."}
+    """
+    
+    if plan not in STRIPE_PRICES:
+        raise HTTPException(status_code=400, detail=f"Invalid plan: {plan}")
+    
+    try:
+        # Import stripe here para não dar erro se não estiver instalado
+        import stripe
+        stripe.api_key = STRIPE_SECRET_KEY
+        
+        checkout_session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price': STRIPE_PRICES[plan],
+                'quantity': 1,
+            }],
+            mode='payment',
+            success_url=success_url or 'https://psi-api.com/success?session_id={CHECKOUT_SESSION_ID}',
+            cancel_url=cancel_url or 'https://psi-api.com/cancel',
+            metadata={
+                'plan': plan
+            }
+        )
+        
+        return {
+            "checkout_url": checkout_session.url,
+            "session_id": checkout_session.id
+        }
+        
+    except ImportError:
+        # Se Stripe não estiver instalado, simular checkout
+        return {
+            "checkout_url": f"https://checkout.stripe.com/pay/test#{plan}",
+            "session_id": "cs_test_123",
+            "message": "⚠️ Stripe não instalado - checkout simulado"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
+
+@app.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    """
+    Webhook do Stripe para processar pagamentos confirmados
+    """
+    payload = await request.body()
+    sig_header = request.headers.get('stripe-signature')
+    
+    try:
+        # Import stripe here para não dar erro se não estiver instalado
+        import stripe
+        stripe.api_key = STRIPE_SECRET_KEY
+        
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except ImportError:
+        return {"status": "error", "message": "Stripe não instalado"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError as e:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    
+    # Processar evento de pagamento confirmado
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        
+        # Extrair informações do pagamento
+        customer_email = session.get('customer_details', {}).get('email', 'unknown@email.com')
+        plan = session.get('metadata', {}).get('plan', 'starter')
+        
+        # Mapear planos para créditos
+        credits_map = {
+            'starter': 2000,
+            'pro': 6000
+        }
+        credits = credits_map.get(plan, 2000)
+        
+        # Gerar API key única
+        raw = f"{customer_email}{datetime.now()}{credits}"
+        api_key = "psi_" + hashlib.sha256(raw.encode()).hexdigest()[:28]
+        
+        # Adicionar créditos ao sistema
+        add_credits(api_key, credits, customer_email)
+        
+        # Log do pagamento
+        print(f"💰 PAGAMENTO CONFIRMADO:")
+        print(f"   Email: {customer_email}")
+        print(f"   Plano: {plan}")
+        print(f"   Créditos: {credits}")
+        print(f"   API Key: {api_key}")
+        
+        # TODO: Enviar email com API key
+        # send_api_key_email(customer_email, api_key, credits)
+        
+        return {"status": "success", "api_key": api_key}
+    
+    return {"status": "ignored", "event_type": event['type']}
+
+def send_api_key_email(email: str, api_key: str, credits: int):
+    """
+    Envia email com API key após pagamento
+    TODO: Implementar com SendGrid, Mailgun ou similar
+    """
+    email_content = f"""
+    🎉 Pagamento confirmado! Sua PSI API está pronta.
+    
+    API KEY: {api_key}
+    CRÉDITOS: {credits:,}
+    
+    Como usar:
+    1. Acesse: https://psi-api-ve66.onrender.com/docs
+    2. Use o header: X-API-Key: {api_key}
+    3. Endpoint: POST /detect
+    
+    Suporte: api@psi.com.br
+    """
+    
+    print(f"📧 EMAIL para {email}:")
+    print(email_content)
+    
+    # TODO: Implementar envio real
+    # import sendgrid
+    # sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
+    # ...
+
+@app.get("/success")
+async def payment_success(session_id: str = None):
+    """Página de sucesso após pagamento"""
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Pagamento Confirmado - PSI API</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; text-align: center; padding: 50px; }}
+            .success {{ background: #d1fae5; padding: 20px; border-radius: 10px; margin: 20px auto; max-width: 500px; }}
+            .api-key {{ background: #f3f4f6; padding: 15px; border-radius: 5px; font-family: monospace; margin: 10px 0; }}
+        </style>
+    </head>
+    <body>
+        <div class="success">
+            <h1>🎉 Pagamento Confirmado!</h1>
+            <p>Sua PSI API está pronta para uso.</p>
+            
+            <div class="api-key">
+                Session ID: {session_id or 'Processando...'}
+            </div>
+            
+            <p><strong>Próximos passos:</strong></p>
+            <ol>
+                <li>Verifique seu email com a API key</li>
+                <li>Acesse a <a href="/docs">documentação</a></li>
+                <li>Integre em 5 minutos</li>
+                <li>Triplique suas conversões!</li>
+            </ol>
+            
+            <p>Suporte: <a href="mailto:api@psi.com.br">api@psi.com.br</a></p>
+        </div>
     </body>
     </html>
     """
