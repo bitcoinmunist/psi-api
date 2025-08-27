@@ -1,21 +1,8 @@
-# PSI API - Dependências
-# Python 3.11+ recomendado
-
-# Core API
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-pydantic==2.5.0
-redis==5.0.1
-httpx==0.25.0
-
-# Pagamento
-stripe==7.0.0
-
-# Desenvolvimento
-python-dotenv==1.0.0
-
-# Deploy
-gunicorn==21.2.0
-
-# Opcional (se quiser usar IA)
-# openai==1.3.0
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+httpx
+redis
+stripe
+gunicorn
